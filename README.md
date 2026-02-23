@@ -9,7 +9,7 @@ and exposes it through a REST API so the app can check for updates on startup.
 ## Disclaimer
 This project was partially created using ChatGPT.
 
---
+---
 ## Architecture
 
 - Flask (REST API)
