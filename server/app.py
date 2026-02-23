@@ -177,23 +177,41 @@ def check():
 
     # sehr einfache Vergleichslogik:
     # Wenn build vorhanden ist, vergleichen wir build numerisch, sonst raw string fallback.
-    def parse(v: str) -> Tuple[str, Optional[int]]:
+        # SemVer (+ optional build) korrekt vergleichen:
+    # 1) major/minor/patch
+    # 2) wenn gleich -> build (numerisch, fehlend = 0)
+    def parse_version(v: str) -> Tuple[int, int, int, int]:
         v = v.strip()
+        build = 0
+
         if "+" in v:
-            a, b = v.split("+", 1)
-            b = b.strip()
-            return a.strip(), int(b) if b.isdigit() else None
-        return v, None
+            version_part, build_part = v.split("+", 1)
+            build_part = build_part.strip()
+            if build_part.isdigit():
+                build = int(build_part)
+        else:
+            version_part = v
 
-    cur_v, cur_b = parse(current)
-    lat_v, lat_b = parse(latest_raw)
+        parts = [p.strip() for p in version_part.split(".")]
+        if len(parts) != 3 or not all(p.isdigit() for p in parts):
+            raise ValueError(f"Invalid version format: {v}. Expected e.g. 1.16.1+3")
 
-    update_available = False
-    if lat_b is not None and cur_b is not None:
-        update_available = lat_b > cur_b
-    else:
-        # fallback: string compare ist nicht perfekt, aber minimal
-        update_available = latest_raw != current
+        major, minor, patch = (int(parts[0]), int(parts[1]), int(parts[2]))
+        return major, minor, patch, build
+
+    try:
+        cur = parse_version(current)
+        lat = parse_version(latest_raw)
+
+        if lat[:3] > cur[:3]:
+            update_available = True
+        elif lat[:3] < cur[:3]:
+            update_available = False
+        else:
+            update_available = lat[3] > cur[3]
+
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
 
     return jsonify({
         "ok": True,
