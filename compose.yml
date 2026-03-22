@@ -9,6 +9,9 @@ services:
       - GITHUB_PUBSPEC_PATH=${GITHUB_PUBSPEC_PATH}
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - CACHE_TTL_SECONDS=${CACHE_TTL_SECONDS}
+      - DOWNLOAD_CACHE_DIR=/app/cache
+    volumes:
+      - release_cache:/app/cache
     expose:
       - "8000"
     networks:
@@ -34,4 +37,7 @@ networks:
   internal_net:
     external: true
   external_net:
-    external: true  
+    external: true
+
+volumes:
+  release_cache:

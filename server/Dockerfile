@@ -3,6 +3,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 RUN useradd -m appuser
+RUN mkdir -p /app/cache && chown -R appuser:appuser /app
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 

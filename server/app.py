@@ -1,10 +1,11 @@
 import os
 import re
+import shutil
 import time
 from typing import Any, Dict, Optional, Tuple
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 
 app = Flask(__name__)
 
@@ -18,6 +19,17 @@ GITHUB_RELEASES_MODE = os.getenv("GITHUB_RELEASES_MODE", "latest").strip().lower
 GITHUB_INCLUDE_PRERELEASES = os.getenv("GITHUB_INCLUDE_PRERELEASES", "0").strip() == "1"
 
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "60"))
+DOWNLOAD_CACHE_DIR = os.getenv("DOWNLOAD_CACHE_DIR", "/app/cache").strip() or "/app/cache"
+
+SUPPORTED_PLATFORM_EXTENSIONS = {
+    "android": ".apk",
+    "windows": ".exe",
+}
+
+PUBLISHED_FILENAMES = {
+    "android": "lunalist_update.apk",
+    "windows": "lunalist_update.exe",
+}
 
 _cache: Dict[str, Any] = {
     "expires_at": 0.0,
@@ -29,6 +41,7 @@ _cache: Dict[str, Any] = {
     "last_checked_at": None,
     "error": None,
     "release": None,  # optional: release metadata (id/name/html_url/etc.)
+    "downloads": {},
 }
 
 
@@ -128,6 +141,124 @@ def _fetch_latest_release_from_github() -> Dict[str, Any]:
     return {"unchanged": False, "etag": new_etag, "release": rel}
 
 
+def _detect_platform_from_asset_name(name: str) -> Optional[str]:
+    lower_name = (name or "").strip().lower()
+    for platform, extension in SUPPORTED_PLATFORM_EXTENSIONS.items():
+        if lower_name.endswith(extension):
+            return platform
+    return None
+
+
+def _safe_filename(name: str) -> str:
+    base = os.path.basename((name or "").strip())
+    return re.sub(r"[^A-Za-z0-9._-]", "_", base)
+
+
+def _cache_key(raw_version: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", (raw_version or "").strip()) or "latest"
+
+
+def _supported_assets(release: Dict[str, Any]) -> list[Dict[str, Any]]:
+    assets = release.get("assets") or []
+    supported = []
+
+    for asset in assets:
+        name = (asset.get("name") or "").strip()
+        download_url = (asset.get("browser_download_url") or "").strip()
+        platform = _detect_platform_from_asset_name(name)
+        if not (name and download_url and platform):
+            continue
+
+        supported.append({
+            "id": asset.get("id"),
+            "name": name,
+            "platform": platform,
+            "content_type": asset.get("content_type"),
+            "size": asset.get("size"),
+            "api_url": (asset.get("url") or "").strip(),
+            "download_url": download_url,
+        })
+
+    return supported
+
+
+def _download_asset(asset: Dict[str, Any], destination: str) -> None:
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    temp_path = f"{destination}.part"
+
+    api_url = (asset.get("api_url") or "").strip()
+    if api_url and GITHUB_TOKEN:
+        download_target = api_url
+        headers = _github_headers()
+        headers["Accept"] = "application/octet-stream"
+    else:
+        download_target = asset["download_url"]
+        headers = {"User-Agent": "version-check-server"}
+
+    with requests.get(download_target, headers=headers, timeout=60, stream=True) as response:
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Asset download failed for {asset['name']}: "
+                f"{response.status_code} - {response.text[:300]}"
+            )
+
+        with open(temp_path, "wb") as handle:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    handle.write(chunk)
+
+    expected_size = asset.get("size")
+    actual_size = os.path.getsize(temp_path)
+    if isinstance(expected_size, int) and expected_size > 0 and actual_size != expected_size:
+        os.remove(temp_path)
+        raise RuntimeError(
+            f"Downloaded asset size mismatch for {asset['name']}: expected {expected_size}, got {actual_size}"
+        )
+
+    os.replace(temp_path, destination)
+
+
+def _cache_release_assets(release: Dict[str, Any], raw_version: str) -> Dict[str, Dict[str, Any]]:
+    supported_assets = _supported_assets(release)
+    if not supported_assets:
+        return {}
+
+    release_cache_dir = os.path.join(DOWNLOAD_CACHE_DIR, _cache_key(raw_version))
+    os.makedirs(release_cache_dir, exist_ok=True)
+
+    cached_assets: Dict[str, Dict[str, Any]] = {}
+    for asset in supported_assets:
+        filename = _safe_filename(asset["name"])
+        local_path = os.path.join(release_cache_dir, filename)
+
+        if not os.path.exists(local_path):
+            _download_asset(asset, local_path)
+        else:
+            expected_size = asset.get("size")
+            if isinstance(expected_size, int) and expected_size > 0 and os.path.getsize(local_path) != expected_size:
+                _download_asset(asset, local_path)
+
+        cached_assets[asset["platform"]] = {
+            "platform": asset["platform"],
+            "name": asset["name"],
+            "content_type": asset.get("content_type") or "application/octet-stream",
+            "download_url": asset["download_url"],
+            "size": asset.get("size"),
+            "path": local_path,
+        }
+
+    return cached_assets
+
+
+def _cleanup_old_cache(raw_version: str) -> None:
+    os.makedirs(DOWNLOAD_CACHE_DIR, exist_ok=True)
+    current_key = _cache_key(raw_version)
+    for entry in os.listdir(DOWNLOAD_CACHE_DIR):
+        entry_path = os.path.join(DOWNLOAD_CACHE_DIR, entry)
+        if entry != current_key and os.path.isdir(entry_path):
+            shutil.rmtree(entry_path, ignore_errors=True)
+
+
 def _refresh_cache(force: bool = False) -> None:
     now = time.time()
     if not force and now < float(_cache.get("expires_at", 0.0)) and _cache.get("raw_version"):
@@ -144,17 +275,32 @@ def _refresh_cache(force: bool = False) -> None:
             rel = fetched["release"] or {}
             tag_name = (rel.get("tag_name") or "").strip()
             v, build, raw = _parse_tag_to_version(tag_name)
+            cached_downloads = _cache_release_assets(rel, raw)
+            _cleanup_old_cache(raw)
 
             _cache["version"] = v
             _cache["build"] = build
             _cache["raw_version"] = raw
             _cache["etag"] = fetched["etag"]
             _cache["source"] = "github-releases"
+            _cache["downloads"] = cached_downloads
             _cache["release"] = {
                 "id": rel.get("id"),
                 "tag_name": rel.get("tag_name"),
                 "name": rel.get("name"),
                 "html_url": rel.get("html_url"),
+                "download_url": _extract_download_url(rel),
+                "assets": [
+                    {
+                        "platform": asset["platform"],
+                        "name": asset["name"],
+                        "content_type": asset["content_type"],
+                        "api_url": asset["api_url"],
+                        "download_url": asset["download_url"],
+                        "size": asset["size"],
+                    }
+                    for asset in _supported_assets(rel)
+                ],
                 "published_at": rel.get("published_at"),
                 "prerelease": rel.get("prerelease"),
                 "draft": rel.get("draft"),
@@ -166,6 +312,31 @@ def _refresh_cache(force: bool = False) -> None:
         _cache["error"] = str(e)
         _cache["last_checked_at"] = int(now)
         _cache["expires_at"] = now + min(CACHE_TTL_SECONDS, 30)
+
+
+def _extract_download_url(release: Dict[str, Any]) -> Optional[str]:
+    supported_assets = _supported_assets(release)
+    if supported_assets:
+        return supported_assets[0]["download_url"]
+
+    html_url = (release.get("html_url") or "").strip()
+    return html_url or None
+
+
+def _requested_platform() -> Optional[str]:
+    platform = (request.args.get("platform") or "").strip().lower()
+    if platform in {"apk", "android"}:
+        return "android"
+    if platform in {"exe", "windows", "win"}:
+        return "windows"
+
+    user_agent = (request.headers.get("User-Agent") or "").lower()
+    if "android" in user_agent:
+        return "android"
+    if "windows" in user_agent:
+        return "windows"
+
+    return None
 
 
 @app.get("/health")
@@ -253,3 +424,39 @@ def check():
         "current": current,
         "latest": latest_raw,
     }), 200
+
+
+@app.get("/download")
+def download():
+    force = request.args.get("force", "0") == "1"
+    _refresh_cache(force=force)
+
+    downloads = _cache.get("downloads") or {}
+    if not downloads:
+        return jsonify({
+            "ok": False,
+            "error": _cache.get("error") or "No cached APK/EXE available for the latest release.",
+            "last_checked_at": _cache.get("last_checked_at"),
+        }), 502
+
+    platform = _requested_platform()
+    selected = downloads.get(platform) if platform else None
+
+    if selected is None and len(downloads) == 1:
+        selected = next(iter(downloads.values()))
+
+    if selected is None:
+        return jsonify({
+            "ok": False,
+            "error": "Multiple cached assets available. Please specify ?platform=android or ?platform=windows.",
+            "available_platforms": sorted(downloads.keys()),
+            "version": _cache.get("raw_version"),
+            "last_checked_at": _cache.get("last_checked_at"),
+        }), 400
+
+    return send_file(
+        selected["path"],
+        as_attachment=True,
+        download_name=PUBLISHED_FILENAMES.get(selected["platform"], selected["name"]),
+        mimetype=selected["content_type"],
+    )

@@ -73,6 +73,33 @@ Example:
 
 ---
 
+### GET /download
+
+Downloads and serves the latest cached release asset directly from this server.
+
+Supported asset types:
+- `.apk` for Android
+- `.exe` for Windows
+
+Behavior:
+- When a new GitHub release is detected, the service downloads the matching asset(s) to the server.
+- The latest files are cached locally in a persistent Docker volume.
+- Older cached release files are removed when a newer release is cached.
+
+Examples:
+
+```bash
+curl -OJ "https://lunalist-version.rar-home.cloud/download?platform=android"
+```
+
+```bash
+curl -OJ "https://lunalist-version.rar-home.cloud/download?platform=windows"
+```
+
+If only one supported asset exists in the latest release, `/download` can also work without `platform`.
+
+---
+
 ## Configuration
 
 Create a `.env` file in the project root directory:
@@ -84,6 +111,7 @@ GITHUB_BRANCH=main
 GITHUB_PUBSPEC_PATH=pubspec.yaml
 GITHUB_TOKEN=github_pat_xxxxxxxxx
 CACHE_TTL_SECONDS=60
+DOWNLOAD_CACHE_DIR=/app/cache
 ```
 
 ### GitHub Token
@@ -160,6 +188,19 @@ Or with version comparison:
 
 ```
 GET https://yourdomain/check?current=1.16.0+5
+```
+
+To fetch the latest download link directly:
+
+```
+GET https://yourdomain/download
+```
+
+For platform-specific binaries:
+
+```
+GET https://yourdomain/download?platform=android
+GET https://yourdomain/download?platform=windows
 ```
 
 If `update_available = true`, the app can trigger the update flow.
